@@ -1,0 +1,590 @@
+#include <WiFi.h>
+#include <WebServer.h>
+#include <SPI.h>
+#include <TFT_eSPI.h>
+#include <XPT2046_Touchscreen.h>
+
+// --- CYD HARDWARE PIN MAPPING ---
+#define XPT2046_CS    33
+#define XPT2046_IRQ   36
+#define XPT2046_MOSI  32
+#define XPT2046_MISO  39
+#define XPT2046_CLK   25
+#define BACKLIGHT_PIN 21
+#define RELAY_PIN     17
+
+TFT_eSPI tft = TFT_eSPI();
+SPIClass touchSPI = SPIClass(VSPI);
+XPT2046_Touchscreen ts(XPT2046_CS, XPT2046_IRQ);
+
+// --- INTERPRETER & STORAGE ENGINE ---
+String codeBuffer[12]; 
+int codeLineCount = 0;
+bool isRunning = false;
+int currentExecutingLine = 0;
+int selectedEditingLine = 0; 
+bool loopMode = false;
+
+// Keeps track of the last dynamically printed message to display it safely
+String livePrintMessage = ""; 
+
+// --- UI STATE MANAGEMENT ---
+enum KeyMode { MODE_ABC, MODE_123, MODE_CMD1, MODE_CMD2 };
+KeyMode currentKeyMode = MODE_ABC;
+bool isLowercase = false;
+String currentInput = "";
+uint16_t terminalBG = 0x0000; 
+
+// --- COMPREHENSIVE MATRICES ---
+const char* keyList[] = {
+  "Q","W","E","R","T","Y","U","I","O","P",
+  "A","S","D","F","G","H","J","K","L",";",
+  "Z","X","C","V","B","N","M",",",".","/"
+};
+
+const char* numList[] = {
+  "1","2","3","4","5","6","7","8","9","0",
+  "!","@","#","$","%","^","&","*","(",")",
+  "+","-","=","_","\"","'","?",":","<",">"
+};
+
+const char* cmdPage1[] = {
+  "setup", "loop", "stop", "pinMode", "dwrite",
+  "dread", "aread", "awrite", "delay", "millis"
+};
+
+const char* cmdPage2[] = {
+  "if", "else", "while", "set", "math",
+  "print", "cls", "HIGH", "LOW", "OUTPUT"
+};
+
+void drawInterface();
+void updateInputDisplay();
+void handleInput(String input);
+void handleSerialCommand(String input);
+
+// --- RENDERING UI COMPONENTS WITH TEXT WRAPPING ---
+void drawTerminalWindow() {
+  tft.fillRect(0, 0, 266, 100, terminalBG);
+  tft.drawRect(0, 0, 266, 100, TFT_GREEN);
+  tft.setTextSize(1);
+  
+  if (codeLineCount == 0 && !isRunning) {
+    tft.setTextColor(TFT_GREEN);
+    tft.setCursor(6, 6);  tft.println("CYD Sandbox Ready...");
+    tft.setCursor(6, 18); tft.println("Press keys & hit ENT to append.");
+    tft.setCursor(6, 30); tft.println("Or use Serial Monitor (115200)...");
+    return;
+  }
+
+  // Reserve the bottom row (y: 86-96) for live runtime PRINT statements
+  int displayRowY = 6; 
+  int maxVerticalLimit = 78; 
+  
+  for (int i = 0; i < 12; i++) {
+    if (i >= codeLineCount && !isRunning && i != selectedEditingLine) continue;
+    if (displayRowY > maxVerticalLimit) break; 
+
+    tft.setCursor(6, displayRowY);
+    
+    if (isRunning && currentExecutingLine == i) {
+      tft.setTextColor(TFT_YELLOW);
+      tft.print("> [RUN] ");
+    } else if (!isRunning && selectedEditingLine == i) {
+      tft.setTextColor(0xFBE0); 
+      tft.print("# [EDT] ");
+    } else {
+      tft.setTextColor(TFT_WHITE);
+      tft.print(String(i + 1) + ": ");
+    }
+    
+    String completeLineText = "";
+    if (i < codeLineCount) {
+      completeLineText = codeBuffer[i];
+    }
+    
+    int maxCharsPerLine = 34; 
+    
+    if (completeLineText.length() <= maxCharsPerLine) {
+      tft.println(completeLineText);
+      displayRowY += 8; 
+    } 
+    else {
+      int printedChars = 0;
+      bool firstChunk = true;
+      
+      while (printedChars < completeLineText.length()) {
+        if (displayRowY > maxVerticalLimit) break;
+        
+        if (!firstChunk) {
+          tft.setCursor(54, displayRowY); 
+        }
+        
+        String chunk = completeLineText.substring(printedChars, printedChars + maxCharsPerLine);
+        tft.println(chunk);
+        
+        printedChars += maxCharsPerLine;
+        displayRowY += 8;
+        firstChunk = false;
+      }
+    }
+  }
+
+  // Re-draw the persistent bottom live print overlay bar if running and populated
+  if (isRunning && livePrintMessage.length() > 0) {
+    tft.fillRect(4, 86, 258, 12, terminalBG);
+    tft.drawFastHLine(4, 84, 258, 0x2444); // Subdued separation border line
+    tft.setTextColor(TFT_GREEN);
+    tft.setCursor(6, 88);
+    tft.print(">> " + livePrintMessage);
+  }
+}
+
+void drawKeyboardZone() {
+  tft.fillRect(0, 130, 266, 110, 0x18C3); 
+  tft.setTextColor(TFT_WHITE);
+  tft.setTextSize(1);
+  
+  if (currentKeyMode == MODE_ABC || currentKeyMode == MODE_123) {
+    for (int i = 0; i < 30; i++) {
+      int col = i % 10;
+      int row = i / 10;
+      int x = (col * 26) + 3;
+      int y = 132 + (row * 26);
+      
+      tft.fillRoundRect(x, y, 24, 22, 2, TFT_BLACK);
+      String label = (currentKeyMode == MODE_ABC) ? String(keyList[i]) : String(numList[i]);
+      if (currentKeyMode == MODE_ABC && isLowercase) label.toLowerCase();
+      tft.drawCentreString(label, x + 12, y + 7, 1);
+    }
+  } 
+  else {
+    for (int i = 0; i < 10; i++) {
+      int col = i % 5;
+      int row = i / 5;
+      int x = (col * 52) + 3;
+      int y = 132 + (row * 38); 
+      
+      tft.fillRoundRect(x, y, 50, 32, 3, 0x2104);
+      tft.drawRect(x, y, 50, 32, TFT_DARKGREY);
+      
+      String label = (currentKeyMode == MODE_CMD1) ? String(cmdPage1[i]) : String(cmdPage2[i]);
+      tft.drawCentreString(label, x + 25, y + 12, 1);
+    }
+  }
+
+  tft.fillRoundRect(2, 212, 36, 25, 4, (currentKeyMode == MODE_ABC)? TFT_BLUE : 0x31A6);
+  tft.drawCentreString("ABC", 20, 220, 1);
+  
+  tft.fillRoundRect(41, 212, 36, 25, 4, (currentKeyMode == MODE_123)? TFT_BLUE : 0x31A6);
+  tft.drawCentreString("123", 59, 220, 1);
+  
+  tft.fillRoundRect(80, 212, 42, 25, 4, (currentKeyMode == MODE_CMD1)? TFT_BLUE : 0x31A6);
+  tft.drawCentreString("CMD1", 101, 220, 1);
+
+  tft.fillRoundRect(125, 212, 42, 25, 4, (currentKeyMode == MODE_CMD2)? TFT_BLUE : 0x31A6);
+  tft.drawCentreString("CMD2", 146, 220, 1);
+
+  tft.fillRoundRect(170, 212, 94, 25, 4, 0x0000);
+  tft.drawCentreString("SPACE", 217, 220, 1);
+}
+
+void drawActionControls() {
+  tft.fillRect(266, 0, 54, 240, 0x2104);
+  tft.drawFastVLine(265, 0, 240, TFT_DARKGREY);
+  tft.setTextColor(TFT_WHITE);
+  tft.setTextSize(1);
+
+  // ENT
+  tft.fillRect(268, 2, 50, 30, 0x03E0);
+  tft.drawCentreString("ENT", 293, 11, 1);
+
+  // DEL
+  tft.fillRect(268, 35, 50, 30, 0x7BEF);
+  tft.drawCentreString("DEL", 293, 44, 1);
+
+  // RUN
+  tft.fillRect(268, 68, 50, 30, TFT_GREEN);
+  tft.setTextColor(TFT_BLACK);
+  tft.drawCentreString("RUN", 293, 77, 1);
+  tft.setTextColor(TFT_WHITE);
+
+  // CLR
+  tft.fillRect(268, 101, 50, 30, TFT_ORANGE);
+  tft.drawCentreString("CLR", 293, 110, 1);
+
+  // STOP
+  tft.fillRect(268, 134, 50, 30, TFT_RED);
+  tft.drawCentreString("STOP", 293, 143, 1);
+
+  // UP
+  tft.fillRect(268, 167, 50, 30, TFT_BLUE);
+  tft.drawCentreString("UP", 293, 176, 1);
+
+  // DN
+  tft.fillRect(268, 200, 50, 38, TFT_BLUE);
+  tft.drawCentreString("DN", 293, 213, 1);
+}
+
+void updateInputDisplay() {
+  tft.fillRect(0, 102, 266, 26, 0x0000);
+  tft.drawRect(0, 102, 266, 26, TFT_DARKGREY);
+  tft.setTextColor(TFT_WHITE);
+  tft.setTextSize(1);
+  
+  String visualInput = currentInput;
+  if (visualInput.length() > 40) {
+    visualInput = "..." + visualInput.substring(visualInput.length() - 37);
+  }
+  tft.drawString("> " + visualInput + "_", 6, 110, 1);
+}
+
+void drawInterface() {
+  tft.fillScreen(TFT_BLACK);
+  drawActionControls();
+  drawTerminalWindow();
+  updateInputDisplay();
+  drawKeyboardZone();
+}
+
+// --- INTERPRETER PROCESS ENGINE ---
+void executeInterpreterStep() {
+  if (!isRunning || codeLineCount == 0) return;
+
+  if (currentExecutingLine >= codeLineCount) {
+    if (loopMode) {
+      currentExecutingLine = 0; 
+    } else {
+      isRunning = false;
+      drawTerminalWindow();
+      Serial.println("[SYSTEM] Execution finished.");
+      return;
+    }
+  }
+
+  String currentLine = codeBuffer[currentExecutingLine];
+  currentLine.trim();
+  drawTerminalWindow();
+
+  String upperLine = currentLine;
+  upperLine.toUpperCase();
+
+  if (upperLine.startsWith("LOOP")) {
+    loopMode = true;
+    currentExecutingLine++;
+    return;
+  }
+
+  if (upperLine.startsWith("VOID")) {
+    currentExecutingLine++;
+    return;
+  }
+
+  if (upperLine.startsWith("DWRITE")) {
+    int firstSpace = currentLine.indexOf(' ');
+    int lastSpace = currentLine.lastIndexOf(' ');
+    if (firstSpace != -1 && lastSpace != firstSpace) {
+      int pin = currentLine.substring(firstSpace + 1, lastSpace).toInt();
+      String stateVal = currentLine.substring(lastSpace + 1);
+      stateVal.toUpperCase();
+      pinMode(pin, OUTPUT);
+      if (stateVal == "HIGH" || stateVal == "1" || stateVal == "HI") {
+        digitalWrite(pin, HIGH);
+      } else {
+        digitalWrite(pin, LOW);
+      }
+    }
+    currentExecutingLine++;
+  } 
+  else if (upperLine.startsWith("DELAY") || upperLine.startsWith("WAIT")) {
+    int spaceIdx = currentLine.indexOf(' ');
+    int ms = currentLine.substring(spaceIdx + 1).toInt();
+    
+    unsigned long startWait = millis();
+    while(millis() - startWait < ms) {
+      if (ts.touched()) {
+        TS_Point p = ts.getPoint();
+        int x = map(p.x, 320, 3900, 0, 320);
+        int y = map(p.y, 240, 3800, 0, 240);
+        if (x >= 266 && y > 134 && y < 164) { 
+          isRunning = false;
+          break;
+        }
+      }
+      if (Serial.available() > 0) {
+        String ser = Serial.readStringUntil('\n');
+        ser.trim(); ser.toUpperCase();
+        if (ser == "STOP") { isRunning = false; break; }
+      }
+      yield();
+    }
+    currentExecutingLine++;
+  }
+  else if (upperLine == "CLS") {
+    // Clear the visual script display section and remove the live print log tracking status
+    livePrintMessage = "";
+    tft.fillRect(2, 2, 262, 96, terminalBG);
+    currentExecutingLine++;
+  }
+  else if (upperLine == "STOP" || upperLine == "END") {
+    isRunning = false;
+    currentExecutingLine = 0;
+  }
+  // DUAL-CHANNEL PRINT HANDLING ENGINE (SCREEN + SERIAL)
+  else if (upperLine.startsWith("PRINT")) {
+    int spaceIdx = currentLine.indexOf(' ');
+    if (spaceIdx != -1) {
+      livePrintMessage = currentLine.substring(spaceIdx + 1);
+      
+      // Route 1: Out to PC Serial Monitor
+      Serial.println("[OUT] " + livePrintMessage);
+      
+      // Route 2: Render directly to screen inside the bottom overlay row bounding box
+      tft.fillRect(4, 86, 258, 12, terminalBG);
+      tft.drawFastHLine(4, 84, 258, 0x2444); 
+      tft.setTextColor(TFT_GREEN);
+      tft.setTextSize(1);
+      tft.setCursor(6, 88);
+      tft.print(">> " + livePrintMessage);
+    }
+    currentExecutingLine++;
+  }
+  else {
+    currentExecutingLine++;
+  }
+  
+  delay(10); 
+}
+
+void handleInput(String input) {
+  input.trim();
+  if (input.length() == 0) return;
+
+  String upperIn = input;
+  upperIn.toUpperCase();
+
+  if (upperIn == "RUN") {
+    if(codeLineCount > 0) {
+      loopMode = false; 
+      isRunning = true;
+      currentExecutingLine = 0;
+      livePrintMessage = ""; // Reset string pointer state
+      Serial.println("[SYSTEM] Script started via Touch.");
+    }
+  } 
+  else if (upperIn == "STOP") {
+    isRunning = false;
+    currentExecutingLine = 0;
+    drawTerminalWindow();
+    Serial.println("[SYSTEM] Script stopped.");
+  } 
+  else if (upperIn == "CLEAR") {
+    codeLineCount = 0;
+    currentExecutingLine = 0;
+    selectedEditingLine = 0;
+    isRunning = false;
+    livePrintMessage = "";
+    drawTerminalWindow();
+    Serial.println("[SYSTEM] Memory wiped.");
+  }
+  else {
+    codeBuffer[selectedEditingLine] = input;
+    if (selectedEditingLine >= codeLineCount) {
+      codeLineCount = selectedEditingLine + 1;
+    }
+    if (selectedEditingLine < 11) {
+      selectedEditingLine++;
+    }
+    drawTerminalWindow();
+  }
+}
+
+void handleSerialCommand(String input) {
+  input.trim();
+  if (input.length() == 0) return;
+
+  String upperIn = input;
+  upperIn.toUpperCase();
+
+  if (upperIn == "RUN") {
+    if (codeLineCount > 0) {
+      loopMode = false;
+      isRunning = true;
+      currentExecutingLine = 0;
+      livePrintMessage = "";
+      drawTerminalWindow();
+      Serial.println("[SYSTEM] Executing script...");
+    } else {
+      Serial.println("[ERROR] Code buffer empty.");
+    }
+    return;
+  }
+  if (upperIn == "STOP") {
+    isRunning = false;
+    currentExecutingLine = 0;
+    drawTerminalWindow();
+    Serial.println("[SYSTEM] Stopped execution.");
+    return;
+  }
+  if (upperIn == "CLEAR") {
+    codeLineCount = 0;
+    currentExecutingLine = 0;
+    selectedEditingLine = 0;
+    isRunning = false;
+    livePrintMessage = "";
+    drawTerminalWindow();
+    Serial.println("[SYSTEM] Code buffer cleared completely.");
+    return;
+  }
+  if (upperIn == "LIST") {
+    Serial.println("--- CURRENT SANDBOX BUFFER ---");
+    for (int i = 0; i < codeLineCount; i++) {
+      Serial.println(String(i + 1) + ": " + codeBuffer[i]);
+    }
+    Serial.println("------------------------------");
+    return;
+  }
+
+  int firstSpace = input.indexOf(' ');
+  if (firstSpace != -1) {
+    String numPart = input.substring(0, firstSpace);
+    int targetLine = numPart.toInt();
+    
+    if (targetLine >= 1 && targetLine <= 12) {
+      String commandPart = input.substring(firstSpace + 1);
+      commandPart.trim();
+      
+      int index = targetLine - 1;
+      codeBuffer[index] = commandPart;
+      
+      if (targetLine > codeLineCount) {
+        codeLineCount = targetLine;
+      }
+      
+      drawTerminalWindow();
+      Serial.println("[OK] Set Line " + String(targetLine) + " -> " + commandPart);
+      return;
+    }
+  }
+
+  codeBuffer[selectedEditingLine] = input;
+  if (selectedEditingLine >= codeLineCount) {
+    codeLineCount = selectedEditingLine + 1;
+  }
+  Serial.println("[OK] Placed row into line pointer index " + String(selectedEditingLine + 1));
+  if (selectedEditingLine < 11) selectedEditingLine++;
+  drawTerminalWindow();
+}
+
+void setup() {
+  Serial.begin(115200);
+  pinMode(BACKLIGHT_PIN, OUTPUT); digitalWrite(BACKLIGHT_PIN, HIGH);
+  pinMode(RELAY_PIN, OUTPUT); digitalWrite(RELAY_PIN, HIGH);
+
+  tft.init();
+  tft.setRotation(1); 
+  
+  touchSPI.begin(XPT2046_CLK, XPT2046_MISO, XPT2046_MOSI, XPT2046_CS);
+  ts.begin(touchSPI);
+  ts.setRotation(1);  
+  
+  drawInterface();
+  Serial.println("[READY] Send commands directly over Serial Console.");
+}
+
+void loop() {
+  if (Serial.available() > 0) {
+    String serialInput = Serial.readStringUntil('\n');
+    handleSerialCommand(serialInput);
+  }
+
+  if (isRunning) {
+    executeInterpreterStep();
+  }
+
+  if (ts.touched()) {
+    TS_Point p = ts.getPoint();
+    int x = map(p.x, 320, 3900, 0, 320);
+    int y = map(p.y, 240, 3800, 0, 240);
+    
+    if (x >= 266) {
+      if (y >= 2 && y < 32) {        // ENT
+        handleInput(currentInput);
+        currentInput = "";
+        updateInputDisplay();
+      } 
+      else if (y >= 35 && y < 65) {   // DEL
+        if (currentInput.length() > 0) {
+          currentInput.remove(currentInput.length() - 1);
+        } else if (codeLineCount > 0 && selectedEditingLine < codeLineCount) {
+          codeBuffer[selectedEditingLine] = "";
+          drawTerminalWindow();
+        }
+        updateInputDisplay();
+      } 
+      else if (y >= 68 && y < 98) {   // RUN
+        handleInput("RUN");
+      } 
+      else if (y >= 101 && y < 131) { // CLR
+        handleInput("CLEAR");
+      } 
+      else if (y >= 134 && y < 164) { // STOP
+        handleInput("STOP");
+      } 
+      else if (y >= 167 && y < 197) { // UP
+        if (selectedEditingLine > 0) {
+          selectedEditingLine--;
+          drawTerminalWindow();
+        }
+      } 
+      else if (y >= 200 && y < 238) { // DN
+        if (selectedEditingLine < 11) {
+          selectedEditingLine++;
+          drawTerminalWindow();
+        }
+      }
+      delay(200); 
+      return;
+    }
+    
+    if (y > 210 && x < 266) {
+      if (x < 40) { currentKeyMode = MODE_ABC; isLowercase = !isLowercase; drawKeyboardZone(); }
+      else if (x < 79) { currentKeyMode = MODE_123; drawKeyboardZone(); }
+      else if (x < 124) { currentKeyMode = MODE_CMD1; drawKeyboardZone(); }
+      else if (x < 169) { currentKeyMode = MODE_CMD2; drawKeyboardZone(); }
+      else { currentInput += " "; updateInputDisplay(); }
+      delay(200);
+      return;
+    }
+    
+    if (y >= 130 && y < 210 && x < 266) {
+      if (currentKeyMode == MODE_ABC || currentKeyMode == MODE_123) {
+        int col = x / 26; if (col > 9) col = 9;
+        int row = (y - 132) / 26; if (row > 2) row = 2;
+        int idx = row * 10 + col;
+        
+        if (idx >= 0 && idx < 30) {
+          if (currentKeyMode == MODE_ABC) {
+            String letter = String(keyList[idx]);
+            if (isLowercase) letter.toLowerCase();
+            currentInput += letter;
+          } else {
+            currentInput += String(numList[idx]);
+          }
+          updateInputDisplay();
+        }
+      } 
+      else {
+        int col = x / 52; if (col > 4) col = 4;
+        int row = (y - 132) / 38; if (row > 1) row = 1;
+        int idx = row * 5 + col;
+        
+        if (idx >= 0 && idx < 10) {
+          currentInput += (currentKeyMode == MODE_CMD1) ? String(cmdPage1[idx]) + " " : String(cmdPage2[idx]) + " ";
+          updateInputDisplay();
+        }
+      }
+      delay(180);
+    }
+  }
+}
